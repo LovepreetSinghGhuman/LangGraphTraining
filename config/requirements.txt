@@ -1,0 +1,35 @@
+# Base dependencies for the RAG application
+# Install with:
+#   pip install -r config/initSetup/requirements_base.txt
+#
+# This file contains the core packages needed for:
+# - LangGraph orchestration and retrieval workflows
+# - Vector store and embedding support
+# - OCR and image processing features
+# - Environment variable loading
+#
+# Note:
+# - The OCR-related packages require the Tesseract engine to be installed
+#   on your system for OCR features to work correctly.
+
+# ── LangGraph & RAG stack ───────────────────────────────
+langgraph
+langchain-core
+langchain-community
+langchain-chroma
+langchain-text-splitters
+langchain-huggingface
+rank-bm25
+
+# ── Embedding and model inference ───────────────────────
+sentence-transformers
+chromadb
+transformers<5.9.0
+accelerate
+
+# ── OCR and image processing ────────────────────────────
+pytesseract
+pillow
+
+# ── Environment configuration ───────────────────────────
+python-dotenv
