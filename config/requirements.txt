@@ -28,8 +28,8 @@ transformers<5.9.0
 accelerate
 
 # ── OCR and image processing ────────────────────────────
-pytesseract
-pillow
+# pytesseract
+# pillow
 
 # ── Environment configuration ───────────────────────────
 python-dotenv
