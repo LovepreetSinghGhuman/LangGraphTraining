@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore")                     # silences the deprecation
 from transformers.utils import logging as hf_logging
 hf_logging.set_verbosity_error()
 
+import re
 from typing import TypedDict, List
 import torch
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
@@ -26,7 +27,6 @@ class AgentState(TypedDict):
 
 # --- ROCm/CUDA device check ---
 # ROCm exposes itself to PyTorch through the same torch.cuda API as NVIDIA CUDA,
-# so torch.cuda.is_available() / torch.cuda.get_device_name() work as-is on your RX 7900 XT.
 if torch.cuda.is_available():
     device_name = torch.cuda.get_device_name(0)
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -36,12 +36,9 @@ else:
 
 # Build the underlying text-generation pipeline first.
 pipeline_llm = HuggingFacePipeline.from_model_id(
-    model_id="Qwen/Qwen2.5-7B-Instruct",
+    model_id="Qwen/Qwen3-0.6B",
     task="text-generation",
-    device="cuda:0" if torch.cuda.is_available() else "cpu",  # pins the whole model to your GPU
-    model_kwargs={
-        "torch_dtype": torch.bfloat16,  # ~14GB instead of ~28GB at fp32, should fit in 20GB VRAM
-    },
+    device=0 if torch.cuda.is_available() else -1,  # pins the whole model to GPU index 0 (-1 = CPU)
     pipeline_kwargs={
         "temperature": 0.7,
         "max_new_tokens": 512,
@@ -53,12 +50,17 @@ pipeline_llm = HuggingFacePipeline.from_model_id(
 # ChatHuggingFace wraps that pipeline to give it the chat-model interface.
 llm = ChatHuggingFace(llm=pipeline_llm)
 
+def strip_thinking(text: str) -> str:
+    """Qwen3 emits a <think>...</think> reasoning block before its real answer.
+    Remove it (and any stray leading/trailing whitespace it leaves behind)."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
 def process(state: AgentState) -> AgentState:
     # Process the state and generate a response
     response = llm.invoke(state["messages"])
 
-    # Print the AI's response to the console
-    print(f"\nAI: {response.content}")
+    # Print the AI's response to the console (reasoning block removed)
+    print(f"\nAI: {strip_thinking(response.content)}")
     return state
 
 graph = StateGraph(AgentState)
