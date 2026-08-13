@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")                     # silences the deprecation
 
 import torch
 from dotenv import load_dotenv  # Store and load environment variables from a .env file
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from langgraph.graph import END, StateGraph
@@ -24,9 +24,6 @@ hf_logging.set_verbosity_error()
 
 load_dotenv()  # Load environment variables from .env file
 
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]  # The conversation history, which can include messages from the human, AI, system, and tools.
-
 # --- ROCm/CUDA device check ---
 # ROCm exposes itself to PyTorch through the same torch.cuda API as NVIDIA CUDA,
 # so torch.cuda.is_available() / torch.cuda.get_device_name() work as-is on your RX 7900 XT.
@@ -37,22 +34,37 @@ if torch.cuda.is_available():
 else:
     print("WARNING: No GPU detected by torch — falling back to CPU. Check your ROCm/torch install.")
 
-@tool
-def add(a: int, b: int):
-    """This is an addition function that adds 2 numbers together"""
-    return a + b
+# Global variable to hold the document content
+document_content = ""
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]  # The conversation history, which can include messages from the human, AI, system, and tools.
 
 @tool
-def subtract(a: int, b: int):
-    """Subtraction function"""
-    return a - b
+def update(content: str) -> str:
+    """This is an update function that updates the document content"""
+    global document_content
+    document_content = content
+    return f"Document content updated to: {document_content}"
 
 @tool
-def multiply(a: int, b: int):
-    """Multiplication function"""
-    return a * b
+def save(filename: str) -> str:
+    """This is a save function that saves the document content
+    Arguments:
+        filename: The name of the file to save the document content.
+    """
+    global document_content
 
-tools = [add, subtract, multiply]
+    if not filename.endswith(".txt"):
+        filename = f"{filename}.txt"
+    try:
+        with open(filename, "w") as f:
+            f.write(document_content)
+    except Exception as e:
+        return f"Error saving document content to {filename}: {str(e)}"
+    
+    return f"Document content saved to {filename}: {document_content}"
+
+tools = [update, save]
 
 # Build the underlying text-generation pipeline first (same pattern as Agent_Bot.py).
 pipeline_llm = HuggingFacePipeline.from_model_id(
@@ -74,50 +86,95 @@ pipeline_llm = HuggingFacePipeline.from_model_id(
 # .bind_tools(), which raw transformers model objects don't have.
 model = ChatHuggingFace(llm=pipeline_llm).bind_tools(tools)
 
-def model_call(state: AgentState) -> AgentState:
-    system_prompt = SystemMessage(content=
-        "You are my AI assistant, please answer my query to the best of your ability."
-    )
-    response = model.invoke([system_prompt] + state["messages"])
-    return {"messages": [response]}
+def our_agent(state: AgentState) -> AgentState:
+    system_prompt = SystemMessage(content=f"""
+    You are Drafter, a helpful writing assistant. You are going to help the user update and modify documents.
+    
+    - If the user wants to update or modify content, use the 'update' tool with the complete updated content.
+    - If the user wants to save and finish, you need to use the 'save' tool.
+    - Make sure to always show the current document state after modifications.
+    
+    The current document content is:{document_content}
+    """)
 
+    if not state["messages"]:
+        user_input = "I'm ready to help you update a document. What would you like to create?"
+        user_message = HumanMessage(content=user_input)
 
-def should_continue(state: AgentState):
-    messages = state["messages"]
-    last_message = messages[-1]
-    if not last_message.tool_calls:
-        return "end"
     else:
+        user_input = input("\nWhat would you like to do with the document? ")
+        print(f"\n👤 USER: {user_input}")
+        user_message = HumanMessage(content=user_input)
+
+    all_messages = [system_prompt] + list(state["messages"]) + [user_message]
+
+    response = model.invoke(all_messages)
+
+    print(f"\n🤖 AI: {response.content}")
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        print(f"🔧 USING TOOLS: {[tc['name'] for tc in response.tool_calls]}")
+
+    return {"messages": list(state["messages"]) + [user_message, response]}
+
+def should_continue(state: AgentState) -> str:
+    """Determine if we should continue or end the conversation."""
+
+    messages = state["messages"]
+    
+    if not messages:
         return "continue"
+    
+    # This looks for the most recent tool message....
+    for message in reversed(messages):
+        # ... and checks if this is a ToolMessage resulting from save
+        if (isinstance(message, ToolMessage) and 
+            "saved" in message.content.lower() and
+            "document" in message.content.lower()):
+            return "end" # goes to the end edge which leads to the endpoint
+        
+    return "continue"
+
+def print_messages(messages):
+    """Function I made to print the messages in a more readable format"""
+    if not messages:
+        return
+    
+    for message in messages[-3:]:
+        if isinstance(message, ToolMessage):
+            print(f"\n🛠️ TOOL RESULT: {message.content}")
+
 
 graph = StateGraph(AgentState)
-graph.add_node("llm_agent", model_call)
 
-tool_node = ToolNode(tools=tools, name="tool_node")
-graph.add_node(tool_node)
+graph.add_node("agent", our_agent)
+graph.add_node("tools", ToolNode(tools))
 
-graph.set_entry_point("llm_agent")
+graph.set_entry_point("agent")
+
+graph.add_edge("agent", "tools")
+
 
 graph.add_conditional_edges(
-    "llm_agent",
+    "tools",
     should_continue,
     {
-        "continue": "tool_node",
-        "end": END
-    }
+        "continue": "agent",
+        "end": END,
+    },
 )
-
-graph.add_edge("tool_node", "llm_agent")
 
 app = graph.compile()
 
-def print_stream(stream):
-    for s in stream:
-        message = s["messages"][-1]
-        if isinstance(message, tuple):
-            print(message)
-        else:
-            message.pretty_print()
+def run_document_agent():
+    print("\n ===== DRAFTER =====")
+    
+    state = {"messages": []}
+    
+    for step in app.stream(state, stream_mode="values"):
+        if "messages" in step:
+            print_messages(step["messages"])
+    
+    print("\n ===== DRAFTER FINISHED =====")
 
-inputs = {"messages": [("user", "Add 40 + 12 and then multiply the result by 6. Also tell me a joke please.")]}
-print_stream(app.stream(inputs, stream_mode="values"))
+if __name__ == "__main__":
+    run_document_agent()
