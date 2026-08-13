@@ -96,7 +96,7 @@ graph.add_node("llm_agent", model_call)
 tool_node = ToolNode(tools=tools, name="tool_node")
 graph.add_node(tool_node)
 
-graph.set_entrypoint("llm_agent")
+graph.set_entry_point("llm_agent")
 
 graph.add_conditional_edges(
     "llm_agent",
