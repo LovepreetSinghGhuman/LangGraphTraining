@@ -13,7 +13,7 @@ from transformers.utils import logging as hf_logging
 hf_logging.set_verbosity_error()
 
 import re
-from typing import TypedDict, List
+from typing import TypedDict, List, Union
 import torch
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
@@ -23,7 +23,7 @@ from dotenv import load_dotenv # Store and load environment variables from a .en
 load_dotenv()  # Load environment variables from .env file
 
 class AgentState(TypedDict):
-    messages: List[HumanMessage]
+    messages: List[Union[HumanMessage, AIMessage]]
 
 # --- ROCm/CUDA device check ---
 # ROCm exposes itself to PyTorch through the same torch.cuda API as NVIDIA CUDA,
@@ -60,7 +60,9 @@ def process(state: AgentState) -> AgentState:
     response = llm.invoke(state["messages"])
 
     # Print the AI's response to the console (reasoning block removed)
+    state["messages"].append(AIMessage(content=strip_thinking(response.content)))
     print(f"\nAI: {strip_thinking(response.content)}")
+    print(f"Current State: {state['messages']}")
     return state
 
 graph = StateGraph(AgentState)
