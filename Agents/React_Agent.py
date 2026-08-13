@@ -1,5 +1,4 @@
 import os
-import re
 import warnings
 from typing import Annotated, Sequence, TypedDict
 
@@ -15,10 +14,10 @@ import torch
 from dotenv import load_dotenv  # Store and load environment variables from a .env file
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from transformers import AutoModelForMultimodalLM, AutoProcessor
 from transformers.utils import logging as hf_logging
 
 hf_logging.set_verbosity_error()
@@ -30,6 +29,7 @@ class AgentState(TypedDict):
 
 # --- ROCm/CUDA device check ---
 # ROCm exposes itself to PyTorch through the same torch.cuda API as NVIDIA CUDA,
+# so torch.cuda.is_available() / torch.cuda.get_device_name() work as-is on your RX 7900 XT.
 if torch.cuda.is_available():
     device_name = torch.cuda.get_device_name(0)
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -38,10 +38,9 @@ else:
     print("WARNING: No GPU detected by torch — falling back to CPU. Check your ROCm/torch install.")
 
 @tool
-def add(a: int, b:int):
+def add(a: int, b: int):
     """This is an addition function that adds 2 numbers together"""
-
-    return a + b 
+    return a + b
 
 @tool
 def subtract(a: int, b: int):
@@ -55,10 +54,27 @@ def multiply(a: int, b: int):
 
 tools = [add, subtract, multiply]
 
-processor = AutoProcessor.from_pretrained("google/gemma-4-E4B-it")
-model = AutoModelForMultimodalLM.from_pretrained("google/gemma-4-E4B-it", device_map="auto").bind_tools(tools)
+# Build the underlying text-generation pipeline first (same pattern as Agent_Bot.py).
+pipeline_llm = HuggingFacePipeline.from_model_id(
+    model_id="Qwen/Qwen2.5-7B-Instruct",
+    task="text-generation",
+    device=0 if torch.cuda.is_available() else -1,  # pins the whole model to GPU index 0 (-1 = CPU)
+    model_kwargs={
+        "torch_dtype": torch.bfloat16,  # ~14GB instead of ~28GB at fp32, should fit in 20GB VRAM
+    },
+    pipeline_kwargs={
+        "temperature": 0.7,
+        "max_new_tokens": 512,
+        "do_sample": True,
+        "return_full_text": False,  # stops the prompt/template being echoed back in the output
+    },
+)
 
-def model_call(state:AgentState) -> AgentState:
+# ChatHuggingFace wraps that pipeline to give it the chat-model interface, including
+# .bind_tools(), which raw transformers model objects don't have.
+model = ChatHuggingFace(llm=pipeline_llm).bind_tools(tools)
+
+def model_call(state: AgentState) -> AgentState:
     system_prompt = SystemMessage(content=
         "You are my AI assistant, please answer my query to the best of your ability."
     )
@@ -66,10 +82,10 @@ def model_call(state:AgentState) -> AgentState:
     return {"messages": [response]}
 
 
-def should_continue(state: AgentState): 
+def should_continue(state: AgentState):
     messages = state["messages"]
     last_message = messages[-1]
-    if not last_message.tool_calls: 
+    if not last_message.tool_calls:
         return "end"
     else:
         return "continue"
