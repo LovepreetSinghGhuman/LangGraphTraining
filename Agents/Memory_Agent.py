@@ -1,4 +1,7 @@
 import os
+import re
+import warnings
+from typing import List, TypedDict, Union
 
 # --- Quiet down noisy library logging/progress bars (must run before the
 # relevant libraries are imported / models are loaded) ---
@@ -6,19 +9,16 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"     # kills "Loading weights: 1
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"        # only show real errors
 os.environ["TOKENIZERS_PARALLELISM"] = "false"        # silences the tokenizer fork warning
 
-import warnings
 warnings.filterwarnings("ignore")                     # silences the deprecation / max_new_tokens warnings
 
-from transformers.utils import logging as hf_logging
-hf_logging.set_verbosity_error()
-
-import re
-from typing import TypedDict, List, Union
 import torch
+from dotenv import load_dotenv # Store and load environment variables from a .env file
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from langgraph.graph import StateGraph, START, END
-from dotenv import load_dotenv # Store and load environment variables from a .env file
+from transformers.utils import logging as hf_logging
+
+hf_logging.set_verbosity_error()
 
 load_dotenv()  # Load environment variables from .env file
 

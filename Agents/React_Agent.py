@@ -1,4 +1,7 @@
 import os
+import re
+import warnings
+from typing import Annotated, Sequence, TypedDict
 
 # --- Quiet down noisy library logging/progress bars (must run before the
 # relevant libraries are imported / models are loaded) ---
@@ -6,24 +9,24 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"     # kills "Loading weights: 1
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"        # only show real errors
 os.environ["TOKENIZERS_PARALLELISM"] = "false"        # silences the tokenizer fork warning
 
-import warnings
 warnings.filterwarnings("ignore")                     # silences the deprecation / max_new_tokens warnings
 
-from transformers.utils import logging as hf_logging
-hf_logging.set_verbosity_error()
-
-import re
-from typing import TypedDict, List, Union
 import torch
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
-from langgraph.graph import StateGraph, START, END
-from dotenv import load_dotenv # Store and load environment variables from a .env file
+from dotenv import load_dotenv  # Store and load environment variables from a .env file
+from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from transformers import AutoModelForMultimodalLM, AutoProcessor
+from transformers.utils import logging as hf_logging
+
+hf_logging.set_verbosity_error()
 
 load_dotenv()  # Load environment variables from .env file
 
 class AgentState(TypedDict):
-    messages: List[Union[HumanMessage, AIMessage]]
+    messages: Annotated[Sequence[BaseMessage], add_messages]  # The conversation history, which can include messages from the human, AI, system, and tools.
 
 # --- ROCm/CUDA device check ---
 # ROCm exposes itself to PyTorch through the same torch.cuda API as NVIDIA CUDA,
@@ -34,64 +37,71 @@ if torch.cuda.is_available():
 else:
     print("WARNING: No GPU detected by torch — falling back to CPU. Check your ROCm/torch install.")
 
-# Build the underlying text-generation pipeline first.
-pipeline_llm = HuggingFacePipeline.from_model_id(
-    model_id="Qwen/Qwen3-0.6B",
-    task="text-generation",
-    device=0 if torch.cuda.is_available() else -1,  # pins the whole model to GPU index 0 (-1 = CPU)
-    pipeline_kwargs={
-        "temperature": 0.7,
-        "max_new_tokens": 512,
-        "do_sample": True,
-        "return_full_text": False,  # stops the prompt/template being echoed back in the output
-    },
-)
+@tool
+def add(a: int, b:int):
+    """This is an addition function that adds 2 numbers together"""
 
-# ChatHuggingFace wraps that pipeline to give it the chat-model interface.
-llm = ChatHuggingFace(llm=pipeline_llm)
+    return a + b 
 
-def strip_thinking(text: str) -> str:
-    """Qwen3 emits a <think>...</think> reasoning block before its real answer.
-    Remove it (and any stray leading/trailing whitespace it leaves behind)."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+@tool
+def subtract(a: int, b: int):
+    """Subtraction function"""
+    return a - b
 
-def process(state: AgentState) -> AgentState:
-    # Process the state and generate a response
-    response = llm.invoke(state["messages"])
+@tool
+def multiply(a: int, b: int):
+    """Multiplication function"""
+    return a * b
 
-    # Print the AI's response to the console (reasoning block removed)
-    print(f"\nAI: {strip_thinking(response.content)}")
-    return state
+tools = [add, subtract, multiply]
+
+processor = AutoProcessor.from_pretrained("google/gemma-4-E4B-it")
+model = AutoModelForMultimodalLM.from_pretrained("google/gemma-4-E4B-it", device_map="auto").bind_tools(tools)
+
+def model_call(state:AgentState) -> AgentState:
+    system_prompt = SystemMessage(content=
+        "You are my AI assistant, please answer my query to the best of your ability."
+    )
+    response = model.invoke([system_prompt] + state["messages"])
+    return {"messages": [response]}
+
+
+def should_continue(state: AgentState): 
+    messages = state["messages"]
+    last_message = messages[-1]
+    if not last_message.tool_calls: 
+        return "end"
+    else:
+        return "continue"
 
 graph = StateGraph(AgentState)
-graph.add_node("process", process)
-graph.add_edge(START, "process")
-graph.add_edge("process", END)
-agent = graph.compile()
+graph.add_node("llm_agent", model_call)
 
-conversation_history = []
+tool_node = ToolNode(tools=tools, name="tool_node")
+graph.add_node(tool_node)
 
-print("Type 'exit' or 'quit' to end the conversation.")
-print(f"Using device: {'cuda:0 (' + torch.cuda.get_device_name(0) + ')' if torch.cuda.is_available() else 'cpu'}")\
+graph.set_entrypoint("llm_agent")
 
-user_input = input("Enter: ")
-while user_input.lower() not in ["exit", "quit"]:
-    conversation_history.append(HumanMessage(content=user_input))
-    result = agent.invoke({"messages": conversation_history})
-    conversation_history = result["messages"]  # Update the conversation history with the latest messages
-    
-    # Get the next user input
-    user_input = input("Enter: ")
+graph.add_conditional_edges(
+    "llm_agent",
+    should_continue,
+    {
+        "continue": "tool_node",
+        "end": END
+    }
+)
 
-with open("conversation_history.txt", "w", encoding="utf-8") as file:
-    file.write("Conversation History:\n")
+graph.add_edge("tool_node", "llm_agent")
 
-    for message in conversation_history:
-        if isinstance(message, HumanMessage):
-            file.write(f"Human: {message.content}\n")
-        elif isinstance(message, AIMessage):
-            file.write(f"AI: {message.content}\n")
+app = graph.compile()
 
-    file.write("\nEnd of Conversation\n")
+def print_stream(stream):
+    for s in stream:
+        message = s["messages"][-1]
+        if isinstance(message, tuple):
+            print(message)
+        else:
+            message.pretty_print()
 
-print("Conversation history saved to 'conversation_history.txt'.")
+inputs = {"messages": [("user", "Add 40 + 12 and then multiply the result by 6. Also tell me a joke please.")]}
+print_stream(app.stream(inputs, stream_mode="values"))
